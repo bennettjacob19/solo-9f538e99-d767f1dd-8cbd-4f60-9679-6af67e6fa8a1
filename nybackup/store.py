@@ -28,6 +28,9 @@ DEFAULT_CONFIG = {
     "backup_time": "02:30",
     "timezone": "America/New_York",
     "clock_offset_seconds": 0.0,
+    # How many of the newest *unprotected* downloadable backups to keep.
+    # 0 means "unlimited" (the default); a limit is always >= 1.
+    "retention_count": 0,
 }
 
 SCHEMA = """
@@ -38,7 +41,7 @@ CREATE TABLE IF NOT EXISTS config (
 
 CREATE TABLE IF NOT EXISTS plans (
     plan_date           TEXT PRIMARY KEY,
-    status              TEXT NOT NULL,       -- pending|running|complete|failed|skipped
+    status              TEXT NOT NULL,       -- pending|running|complete|failed|skipped|cleaned
     due_utc             TEXT NOT NULL,
     configured_time     TEXT NOT NULL,       -- HH:MM in effect for this plan
     started_utc         TEXT,                -- virtual clock
@@ -53,6 +56,9 @@ CREATE TABLE IF NOT EXISTS plans (
     ambiguous           INTEGER NOT NULL DEFAULT 0,
     error               TEXT,
     attempts            INTEGER NOT NULL DEFAULT 0,
+    protected           INTEGER NOT NULL DEFAULT 0,  -- protected backups ignore the retention quota
+    cleaned_utc         TEXT,                -- virtual clock time of the retention cleanup
+    cleanup_error       TEXT,                -- last failed cleanup attempt (retried later)
     updated_utc         TEXT NOT NULL
 );
 
@@ -64,6 +70,14 @@ CREATE TABLE IF NOT EXISTS events (
     message       TEXT NOT NULL
 );
 """
+
+# Columns added after the first release: existing state databases are upgraded
+# in place with ALTER TABLE (SQLite allows constant defaults there).
+PLAN_COLUMN_MIGRATIONS = {
+    "protected": "ALTER TABLE plans ADD COLUMN protected INTEGER NOT NULL DEFAULT 0",
+    "cleaned_utc": "ALTER TABLE plans ADD COLUMN cleaned_utc TEXT",
+    "cleanup_error": "ALTER TABLE plans ADD COLUMN cleanup_error TEXT",
+}
 
 def iso_utc(dt: Optional[datetime]) -> Optional[str]:
     return None if dt is None else dt.astimezone(timezone.utc).isoformat(timespec="seconds")
@@ -119,6 +133,15 @@ class Store:
         self._conn.execute("PRAGMA busy_timeout=30000")
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        existing = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(plans)")
+        }
+        for column, ddl in PLAN_COLUMN_MIGRATIONS.items():
+            if column not in existing:
+                self._conn.execute(ddl)
 
     # -- plumbing ---------------------------------------------------------
     def close(self) -> None:
@@ -342,4 +365,55 @@ class Store:
                 WHERE plan_date=?
                 """,
                 (reason, iso_utc(real_now), plan_date.isoformat()),
+            )
+
+    # -- retention / protection --------------------------------------------
+    def set_protected(self, plan_date: date, protected: bool, *, real_now: datetime) -> bool:
+        """Toggle the protection flag of a completed backup.
+
+        Returns ``False`` when the plan has no completed backup (nothing to
+        protect) — e.g. it was cleaned by the retention rule in the meantime.
+        """
+        with self.transaction() as c:
+            cur = c.execute(
+                "UPDATE plans SET protected=?, updated_utc=? "
+                "WHERE plan_date=? AND status='complete'",
+                (int(protected), iso_utc(real_now), plan_date.isoformat()),
+            )
+            return cur.rowcount > 0
+
+    def mark_cleaned(
+        self,
+        plan_date: date,
+        *,
+        virtual_now: datetime,
+        real_now: datetime,
+    ) -> None:
+        """Record that the plan's backup file was removed by the retention rule.
+
+        ``cleaned`` is terminal: the day is never re-backed-up, even if the
+        drill clock moves back onto it.  The filename/size are kept so the
+        page can still show what used to be there.
+        """
+        with self.transaction() as c:
+            c.execute(
+                """
+                UPDATE plans SET status='cleaned', cleaned_utc=?, cleanup_error=NULL,
+                                 partial_path=NULL, updated_utc=?
+                WHERE plan_date=?
+                """,
+                (iso_utc(virtual_now), iso_utc(real_now), plan_date.isoformat()),
+            )
+
+    def set_cleanup_error(
+        self,
+        plan_date: date,
+        error: Optional[str],
+        *,
+        real_now: datetime,
+    ) -> None:
+        with self.transaction() as c:
+            c.execute(
+                "UPDATE plans SET cleanup_error=?, updated_utc=? WHERE plan_date=?",
+                (error, iso_utc(real_now), plan_date.isoformat()),
             )

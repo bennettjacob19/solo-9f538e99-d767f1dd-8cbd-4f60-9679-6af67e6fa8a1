@@ -13,6 +13,14 @@ Rules implemented here
 * On restart, a fully written backup file is adopted as-is (same bytes, same
   mtime).  Leftover temp files are removed and the affected plan is retried
   under the catch-up rule.
+* Retention: the newest ``retention_count`` downloadable *unprotected*
+  backups are kept (0/unset = unlimited); older excess files are cleaned.
+  A day cleaned this way is terminal — automatic catch-up and manual runs
+  never recreate it, even if the drill clock moves back onto it.  A cleanup
+  that fails leaves the file downloadable, records the reason on the plan,
+  and is retried under the latest rules on a later pass.  If the process
+  exits after deleting a file but before recording it, the start-up
+  reconcile marks the day ``cleaned``.
 
 Only one backup runs at a time; a tick is guarded and the snapshot writer is
 additionally guarded in :mod:`nybackup.backup`.
@@ -67,6 +75,7 @@ class Service:
         self._thread: Optional[threading.Thread] = None
         self._tick_lock = threading.Lock()
         self._run_lock = threading.Lock()
+        self._retention_lock = threading.Lock()
         self._last_eval_cache: Optional[datetime] = None
         self._last_eval_persisted: Optional[datetime] = None
         # Persisting the watermark every tick would write to disk each second;
@@ -89,7 +98,17 @@ class Service:
             "backup_time": cfg.get("backup_time", "02:30"),
             "timezone": cfg.get("timezone", TZ_NAME),
             "clock_offset_seconds": float(cfg.get("clock_offset_seconds", 0.0) or 0.0),
+            "retention_count": self.retention_limit(),
         }
+
+    def retention_limit(self) -> Optional[int]:
+        """Configured keep-count: ``None`` = unlimited, otherwise >= 1."""
+        raw = self.store.config().get("retention_count", 0)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value >= 1 else None
 
     # -- lifecycle --------------------------------------------------------
     def start(self) -> None:
@@ -306,8 +325,14 @@ class Service:
 
         row = self._pick_work(virtual_now)
         if row is None:
-            return {"action": "idle", "virtual_now": iso_utc(virtual_now)}
-        return self._execute(row, virtual_now)
+            result = {"action": "idle", "virtual_now": iso_utc(virtual_now)}
+        else:
+            result = self._execute(row, virtual_now)
+        # Retention is enforced on every tick: a new downloadable backup may
+        # push older ones over the limit, and a previously failed cleanup is
+        # retried under the latest rules.
+        self.enforce_retention(trigger="tick")
+        return result
 
     def _pick_work(self, virtual_now: datetime):
         plans = self.store.all_plans()
@@ -336,7 +361,9 @@ class Service:
                     virtual_now=virtual_now,
                     real_now=real_now,
                 )
-        if newest["status"] in ("complete", "running"):
+        if newest["status"] in ("complete", "running", "cleaned"):
+            # "cleaned" is terminal like "complete": the day counts as handled
+            # and is never re-run, even if the drill clock moves back onto it.
             if newest["status"] == "running":
                 # A "running" row whose worker is gone (e.g. a crash inside a
                 # handler before the failure was recorded) is retried.
@@ -554,6 +581,191 @@ class Service:
         except OSError:
             pass
 
+    # -- retention ----------------------------------------------------------
+    def set_protection(self, plan_date: date, protected: bool) -> dict:
+        """Protect or unprotect one completed backup.
+
+        Protected backups never count towards the retention quota and are
+        never cleaned.  Only a ``complete`` plan can be (un)protected; if the
+        retention cleanup already removed it, the request is refused.
+        """
+        real_now = self.real_now()
+        ok = self.store.set_protected(plan_date, protected, real_now=real_now)
+        iso = plan_date.isoformat()
+        if not ok:
+            row = self.store.get_plan(plan_date)
+            if row is not None and row["status"] == "cleaned":
+                message = "该日备份已按保留规则清理，无法更改保护状态"
+            else:
+                message = "该日没有已完成的备份，无法更改保护状态"
+            return {"ok": False, "message": message}
+        self.store.log(
+            "info",
+            f"{'保护' if protected else '解除保护'}计划 {iso} 的备份"
+            + ("" if protected else "；解除后按最新保留规则处理"),
+            virtual_now=self.now(),
+            real_now=real_now,
+        )
+        return {"ok": True}
+
+    def enforce_retention(self, *, trigger: str = "tick") -> dict:
+        """Keep the newest N downloadable unprotected backups, clean the rest.
+
+        Runs after the retention count changes, after a protect/unprotect,
+        after a new backup becomes downloadable (scheduled or manual), and on
+        every scheduler tick so a failed cleanup is retried under the latest
+        rules.  Also reconciles the crash window: a ``complete`` plan whose
+        file is gone (deleted but never recorded) becomes ``cleaned``.
+        """
+        if not self._retention_lock.acquire(blocking=False):
+            return {"action": "busy"}
+        try:
+            return self._enforce_retention(trigger=trigger)
+        finally:
+            self._retention_lock.release()
+
+    def _enforce_retention(self, *, trigger: str) -> dict:
+        virtual_now = self.now()
+        real_now = self.real_now()
+        limit = self.retention_limit()
+        files = backup.list_backup_files(self.backup_dir)
+        plans = self.store.all_plans()
+        cleaned: list[str] = []
+        failed: list[str] = []
+
+        # 1. Reconcile: the file of a "complete" plan vanished (e.g. the
+        #    process exited after the delete but before recording it).
+        for row in plans:
+            if row["status"] == "complete" and row["plan_date"] not in files:
+                self.store.mark_cleaned(
+                    date.fromisoformat(row["plan_date"]),
+                    virtual_now=virtual_now,
+                    real_now=real_now,
+                )
+                self.store.log(
+                    "warn",
+                    f"计划 {row['plan_date']} 的备份文件已不存在"
+                    "（清理结果落盘前进程可能已退出），记为已清理",
+                    virtual_now=virtual_now,
+                    real_now=real_now,
+                )
+                cleaned.append(row["plan_date"])
+        if cleaned:
+            plans = self.store.all_plans()
+
+        # 2. Candidates: downloadable, unprotected, newest plan date first.
+        downloadable = [
+            row
+            for row in plans
+            if row["status"] == "complete"
+            and not row["protected"]
+            and row["plan_date"] in files
+        ]
+        downloadable.sort(key=lambda r: r["plan_date"], reverse=True)
+        excess = downloadable[limit:] if limit is not None else []
+        excess_dates = {row["plan_date"] for row in excess}
+
+        # 3. A stale failure record disappears once the latest rules no
+        #    longer select the plan (limit raised, backup protected, ...).
+        for row in plans:
+            if (
+                row["status"] == "complete"
+                and row["cleanup_error"]
+                and row["plan_date"] not in excess_dates
+            ):
+                self.store.set_cleanup_error(
+                    date.fromisoformat(row["plan_date"]), None, real_now=real_now
+                )
+                self.store.log(
+                    "info",
+                    f"计划 {row['plan_date']} 按最新保留规则无需清理，"
+                    "已清除此前的清理失败记录",
+                    virtual_now=virtual_now,
+                    real_now=real_now,
+                )
+
+        # 4. Delete the excess.  A failure keeps the file downloadable and is
+        #    retried on a later pass.
+        for row in excess:
+            outcome = self._cleanup_one(
+                date.fromisoformat(row["plan_date"]), virtual_now=virtual_now
+            )
+            if outcome["action"] == "cleaned":
+                cleaned.append(row["plan_date"])
+            elif outcome["action"] == "failed":
+                failed.append(row["plan_date"])
+        return {
+            "action": "ok",
+            "trigger": trigger,
+            "limit": limit,
+            "cleaned": cleaned,
+            "failed": failed,
+        }
+
+    def _cleanup_one(self, plan_date: date, *, virtual_now: datetime) -> dict:
+        """Delete one excess backup file and record the outcome.
+
+        The protection flag is re-checked inside the state-store write
+        transaction that also records the result, so a protect that was saved
+        first always wins and the original file is kept.  The file is deleted
+        before the result is recorded; if the process exits in between, the
+        start-up reconcile marks the day as cleaned.
+        """
+        iso = plan_date.isoformat()
+        real_now = self.real_now()
+        logs: list[tuple[str, str]] = []
+        with self.store.transaction() as c:
+            row = c.execute(
+                "SELECT status, protected, filename, cleanup_error "
+                "FROM plans WHERE plan_date=?",
+                (iso,),
+            ).fetchone()
+            if row is None or row["status"] != "complete":
+                return {"action": "skipped", "reason": "状态已变化，不再清理"}
+            if row["protected"]:
+                # The protect was saved first: the original file must stay.
+                return {"action": "kept", "reason": "保护已先保存，保留原文件"}
+            filename = row["filename"] or backup.backup_filename(plan_date)
+            path = os.path.join(self.backup_dir, filename)
+            try:
+                os.remove(path)
+                remove_error: Optional[str] = None
+            except FileNotFoundError:
+                remove_error = None  # already gone; record the cleanup anyway
+            except OSError as exc:
+                remove_error = f"{type(exc).__name__}: {exc}"
+            if remove_error is not None:
+                c.execute(
+                    "UPDATE plans SET cleanup_error=?, updated_utc=? "
+                    "WHERE plan_date=?",
+                    (remove_error, iso_utc(real_now), iso),
+                )
+                if (row["cleanup_error"] or "") != remove_error:
+                    logs.append(
+                        (
+                            "warn",
+                            f"清理计划 {iso} 的备份文件失败: {remove_error}"
+                            "（文件仍可下载，稍后按最新规则自动重试）",
+                        )
+                    )
+                outcome = {"action": "failed", "error": remove_error}
+            else:
+                c.execute(
+                    "UPDATE plans SET status='cleaned', cleaned_utc=?, "
+                    "cleanup_error=NULL, partial_path=NULL, updated_utc=? "
+                    "WHERE plan_date=?",
+                    (iso_utc(virtual_now), iso_utc(real_now), iso),
+                )
+                logs.append(
+                    ("info", f"按保留规则清理计划 {iso} 的备份文件 {filename}")
+                )
+                outcome = {"action": "cleaned", "filename": filename}
+        for level, message in logs:
+            self.store.log(
+                level, message, virtual_now=virtual_now, real_now=real_now
+            )
+        return outcome
+
     # -- operations -------------------------------------------------------
     def run_plan_now(self, plan_date: date) -> dict:
         settings = self.settings()
@@ -579,12 +791,23 @@ class Service:
                 "message": "该计划已有完整备份，沿用原文件",
                 "filename": row["filename"],
             }
+        if row["status"] == "cleaned":
+            # A cleaned day is never recreated, even on explicit request.
+            return {
+                "action": "none",
+                "message": "该日备份已按保留规则清理，不再重建",
+            }
         if not self._run_lock.acquire(blocking=False):
             return {"action": "busy", "message": "已有备份正在进行"}
         try:
-            return self._execute_locked(row, self.now())
+            result = self._execute_locked(row, self.now())
         finally:
             self._run_lock.release()
+        if result.get("action") in ("complete", "adopted"):
+            # A manual backup becoming downloadable follows the same retention
+            # rule as a scheduled one.
+            self.enforce_retention(trigger="manual")
+        return result
 
     def recover(self) -> None:
         """Start-up housekeeping: drop temp files, adopt intact backups."""
@@ -613,8 +836,24 @@ class Service:
         for iso_date, path in backup.list_backup_files(self.backup_dir).items():
             plan_date = date.fromisoformat(iso_date)
             row = self.store.get_plan(plan_date)
+            if row is not None and row["status"] == "cleaned":
+                # The day was cleaned by the retention rule; a file that
+                # reappeared afterwards (e.g. copied back by hand) is left
+                # alone but does not bring the day back.
+                self.store.log(
+                    "warn",
+                    f"计划 {iso_date} 已按保留规则清理，目录中又出现文件 "
+                    f"{os.path.basename(path)}；保留该文件但不恢复该日备份",
+                    virtual_now=virtual_now,
+                    real_now=real_now,
+                )
+                continue
             if row is None or row["status"] != "complete":
                 self._adopt_existing(plan_date, path, virtual_now=virtual_now)
+        # Reconcile + apply the retention rule: a backup deleted just before
+        # the previous process exited (result never recorded) shows as
+        # cleaned now, and any excess backlog is cleaned under current rules.
+        self.enforce_retention(trigger="recover")
 
     # -- views ------------------------------------------------------------
     def status_snapshot(self) -> dict:

@@ -212,15 +212,56 @@ def create_app(overrides: Optional[dict] = None) -> Flask:
         except ScheduleError as exc:
             flash(str(exc), "error")
             return redirect(url_for("index"))
+        raw_retention = (request.form.get("retention_count") or "").strip()
+        if raw_retention in ("", "0"):
+            retention = 0  # unlimited
+        else:
+            try:
+                retention = int(raw_retention)
+            except ValueError:
+                flash("保留份数必须为不小于 1 的整数，留空或 0 表示不限", "error")
+                return redirect(url_for("index"))
+            if retention < 1:
+                flash("保留份数至少为 1，留空或 0 表示不限", "error")
+                return redirect(url_for("index"))
         old = store.config().get("backup_time")
-        store.set_config({"backup_time": value})
+        old_retention = store.config().get("retention_count", 0)
+        store.set_config({"backup_time": value, "retention_count": retention})
         store.log(
             "info",
-            f"每日备份时刻 {old} → {value}",
+            f"每日备份时刻 {old} → {value}；"
+            f"普通备份保留份数 {old_retention or '不限'} → {retention or '不限'}",
             virtual_now=service.now(),
             real_now=service.real_now(),
         )
-        flash(f"每日备份时刻已设为 {value}（纽约时间）", "success")
+        flash(
+            f"每日备份时刻已设为 {value}（纽约时间）；"
+            f"普通备份保留份数：{retention if retention else '不限'}",
+            "success",
+        )
+        # A changed keep-count takes effect immediately.
+        service.enforce_retention(trigger="settings")
+        service.wake()
+        return redirect(url_for("index"))
+
+    @app.post("/protect/<iso_date>")
+    def protect(iso_date: str):
+        try:
+            plan_date = date.fromisoformat(iso_date)
+        except ValueError:
+            abort(400)
+        want = request.form.get("protected") == "1"
+        result = service.set_protection(plan_date, want)
+        if result["ok"]:
+            flash(
+                f"{iso_date} 的备份已{'保护（不占保留名额）' if want else '解除保护'}",
+                "success",
+            )
+        else:
+            flash(f"{iso_date}：{result['message']}", "error")
+        # Unprotecting may make old backups exceed the quota; protecting may
+        # clear a stale cleanup failure.  Apply the latest rules right away.
+        service.enforce_retention(trigger="protect")
         service.wake()
         return redirect(url_for("index"))
 
@@ -333,6 +374,7 @@ def create_app(overrides: Optional[dict] = None) -> Flask:
             "real_now_utc": iso_utc(snapshot["real_now"]),
             "backup_time": snapshot["settings"]["backup_time"],
             "clock_offset_seconds": snapshot["settings"]["clock_offset_seconds"],
+            "retention_count": snapshot["settings"]["retention_count"],
             "next_due_utc": iso_utc(snapshot["next_due"].instant) if snapshot["next_due"] else None,
             "plans": [dict(row) for row in store.all_plans()],
             "files": sorted(backup.list_backup_files(app.config["BACKUP_DIR"]).keys()),

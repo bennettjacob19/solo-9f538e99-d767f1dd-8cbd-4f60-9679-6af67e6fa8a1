@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import date, timedelta
+
 import pytest
 
 from nybackup import backup, source
@@ -121,7 +123,107 @@ def test_api_status_reports_plans(app):
     assert response.status_code == 200
     payload = response.get_json()
     assert payload["backup_time"] == "02:30"
+    assert payload["retention_count"] is None  # unlimited by default
     assert "virtual_now_utc" in payload
+
+
+def _complete_plan(app, plan_date):
+    """Run a real backup for the given plan date via the service."""
+    service = app.extensions["service"]
+    result = service.run_plan_now(plan_date)
+    assert result["action"] in ("complete", "adopted", "none"), result
+    return app.extensions["store"].get_plan(plan_date)
+
+
+def test_retention_setting_validation(app):
+    client = app.test_client()
+    store = app.extensions["store"]
+    client.post("/settings", data={"backup_time": "02:30", "retention_count": "abc"})
+    assert store.config()["retention_count"] == 0
+    client.post("/settings", data={"backup_time": "02:30", "retention_count": "-2"})
+    assert store.config()["retention_count"] == 0
+    client.post("/settings", data={"backup_time": "02:30", "retention_count": "3"})
+    assert store.config()["retention_count"] == 3
+    # Empty means unlimited again.
+    client.post("/settings", data={"backup_time": "02:30", "retention_count": ""})
+    assert store.config()["retention_count"] == 0
+
+
+def test_protect_toggle_and_page_badge(app):
+    client = app.test_client()
+    store = app.extensions["store"]
+    service = app.extensions["service"]
+    plan_date = service.now().astimezone(service.tz).date()
+    _complete_plan(app, plan_date)
+    iso = plan_date.isoformat()
+
+    response = client.post(f"/protect/{iso}", data={"protected": "1"})
+    assert response.status_code == 302
+    assert store.get_plan(plan_date)["protected"] == 1
+    body = client.get("/").get_data(as_text=True)
+    assert "已保护" in body and "解除保护" in body
+
+    client.post(f"/protect/{iso}", data={"protected": "0"})
+    assert store.get_plan(plan_date)["protected"] == 0
+
+    # Protecting a day without a completed backup is refused gracefully.
+    response = client.post("/protect/1999-01-01", data={"protected": "1"})
+    assert response.status_code == 302
+    assert store.get_plan(date(1999, 1, 1)) is None
+
+
+def test_cleaned_plan_shown_on_page_and_not_downloadable(app):
+    client = app.test_client()
+    store = app.extensions["store"]
+    service = app.extensions["service"]
+    day1 = service.now().astimezone(service.tz).date()
+    _complete_plan(app, day1)
+    day2 = day1 + timedelta(days=1)
+    # Second backup on the next plan date, then keep only one.
+    service.store.set_config({"clock_offset_seconds": 86400.0})
+    _complete_plan(app, day2)
+    store.set_config({"retention_count": 1})
+    service.enforce_retention(trigger="settings")
+    assert store.get_plan(day1)["status"] == "cleaned"
+
+    body = client.get("/").get_data(as_text=True)
+    assert "已清理" in body
+    assert client.get(f"/download/{day1.isoformat()}").status_code == 404
+    assert client.get(f"/download/{day2.isoformat()}").status_code == 200
+
+    # A manual run of the cleaned day is refused and recreates nothing.
+    client.post(f"/run/{day1.isoformat()}")
+    assert store.get_plan(day1)["status"] == "cleaned"
+
+
+def test_cleanup_failure_reason_shown_on_page(app, monkeypatch):
+    import os as _os
+
+    client = app.test_client()
+    store = app.extensions["store"]
+    service = app.extensions["service"]
+    day1 = service.now().astimezone(service.tz).date()
+    _complete_plan(app, day1)
+    day2 = day1 + timedelta(days=1)
+    service.store.set_config({"clock_offset_seconds": 86400.0})
+    _complete_plan(app, day2)
+
+    path = backup.final_path(app.config["BACKUP_DIR"], day1)
+    real_remove = _os.remove
+
+    def failing_remove(target, *args, **kwargs):
+        if _os.path.abspath(target) == _os.path.abspath(path):
+            raise OSError("模拟的删除失败")
+        return real_remove(target, *args, **kwargs)
+
+    monkeypatch.setattr(_os, "remove", failing_remove)
+    store.set_config({"retention_count": 1})
+    service.enforce_retention(trigger="settings")
+
+    body = client.get("/").get_data(as_text=True)
+    assert "清理失败" in body and "模拟的删除失败" in body
+    # Still downloadable while the cleanup cannot remove it.
+    assert client.get(f"/download/{day1.isoformat()}").status_code == 200
 
 
 class tempfile_sqlite:

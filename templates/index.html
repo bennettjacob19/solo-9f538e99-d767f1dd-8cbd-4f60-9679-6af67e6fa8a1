@@ -40,7 +40,10 @@
   <p class="hint">
     每日 {{ settings.backup_time }}（{{ settings.timezone }}）自动备份。
     春季跳时：设定时刻不存在时顺延到跳时后的第一个有效分钟；秋季重复时刻取第一次。
-    停机错过多次时只补最近一次，仍归原计划日期。
+    停机错过多次时只补最近一次，仍归原计划日期。<br>
+    保留规则：普通备份保留最近 <strong>{{ settings.retention_count if settings.retention_count else '不限' }}</strong> 份
+    （按纽约计划日期，受保护的不占名额）；超额旧备份自动清理，清理失败会显示原因并自动重试；
+    已清理的日期不会再重建，即使演练时钟拨回当天。
   </p>
   <table class="plans">
     <thead>
@@ -70,9 +73,18 @@
         </td>
         <td>
           {% if row.plan %}
-            <span class="status">{{ row.plan.status }}</span>
-            {% if row.plan.status == 'skipped' %}<span class="muted">（补跑规则跳过）</span>{% endif %}
+            {% if row.plan.status == 'cleaned' %}
+              <span class="status">已清理</span>
+              {% if row.plan.cleaned_utc %}<div class="muted small">清理于 {{ row.plan.cleaned_utc|local }}</div>{% endif %}
+            {% else %}
+              <span class="status">{{ row.plan.status }}</span>
+              {% if row.plan.status == 'complete' and row.plan.protected %}<span class="badge protect">已保护</span>{% endif %}
+              {% if row.plan.status == 'skipped' %}<span class="muted">（补跑规则跳过）</span>{% endif %}
+            {% endif %}
             {% if row.plan.error %}<div class="muted small">{{ row.plan.error }}</div>{% endif %}
+            {% if row.plan.status == 'complete' and row.plan.cleanup_error %}
+              <div class="cleanup-error small">清理失败：{{ row.plan.cleanup_error }}（将按最新规则自动重试）</div>
+            {% endif %}
           {% elif row.is_future %}
             <span class="status pending">待到期</span>
           {% else %}
@@ -94,6 +106,17 @@
         <td class="actions">
           {% if row.downloadable %}
             <a class="button" href="{{ url_for('download', iso_date=row.iso) }}">下载</a>
+            {% if row.plan.protected %}
+              <form method="post" action="{{ url_for('protect', iso_date=row.iso) }}">
+                <input type="hidden" name="protected" value="0">
+                <button class="button ghost" type="submit">解除保护</button>
+              </form>
+            {% else %}
+              <form method="post" action="{{ url_for('protect', iso_date=row.iso) }}">
+                <input type="hidden" name="protected" value="1">
+                <button class="button ghost" type="submit">保护</button>
+              </form>
+            {% endif %}
           {% else %}
             <span class="muted">不可下载</span>
           {% endif %}
@@ -134,6 +157,10 @@
     <form method="post" action="{{ url_for('settings') }}" class="stack">
       <label>时刻（纽约时间，HH:MM）
         <input name="backup_time" value="{{ settings.backup_time }}" pattern="^([01][0-9]|2[0-3]):[0-5][0-9]$" required>
+      </label>
+      <label>普通备份保留份数（至少 1；留空或 0 = 不限；受保护的不占名额）
+        <input name="retention_count" type="number" min="1" step="1"
+               value="{{ settings.retention_count if settings.retention_count else '' }}" placeholder="不限">
       </label>
       <button class="button" type="submit">保存</button>
     </form>
